@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
@@ -19,6 +19,7 @@ def main():
     error_start = None
 
     while True:
+        start = datetime.utcnow()
         try:
             v1.list_namespace(_request_timeout=3)
             if error_start:
@@ -26,7 +27,8 @@ def main():
                 log(f"RECOVERY: API server available after {recovery_time.total_seconds():.2f} seconds outage.")
                 error_start = None
             else:
-                log("API server OK")
+                if start.second == 0:
+                    log("API server OK")
         except Exception as e:
             if not error_start:
                 error_start = datetime.utcnow()
@@ -40,6 +42,12 @@ def main():
                 else:
                     log(f"ERROR: still unavailable: {repr(e)} (outage ongoing)")
         time.sleep(5)
+        # Sleep until the top of the next second
+        now = datetime.utcnow()
+        next_second = (start + timedelta(seconds=1)).replace(microsecond=0)
+        sleep_time = (next_second - now).total_seconds()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 if __name__ == "__main__":
     main()

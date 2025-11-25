@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cni-sender
+spec:
+  containers:
+  - name: sender
+    image: busybox
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          sleep 1
+          echo test | nc -w 5 cni-receiver 8080
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Cannot connect to cni-receiver, possible CNI outage at $(date)"
+          fi
+        done

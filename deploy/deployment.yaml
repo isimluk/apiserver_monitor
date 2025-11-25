@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apiserver-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apiserver-monitor
+  template:
+    metadata:
+      labels:
+        app: apiserver-monitor
+    spec:
+      containers:
+      - name: apiserver-monitor
+        image: quay.io/slukasik/apiserver_monitor:latest
+        imagePullPolicy: Always
+        # Use in-cluster service account for access
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi

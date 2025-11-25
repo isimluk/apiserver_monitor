@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cni-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cni-receiver
+  template:
+    metadata:
+      labels:
+        app: cni-receiver
+    spec:
+      containers:
+      - name: receiver
+        image: busybox
+        command: ["/bin/sh", "-c", "while true; do nc -l -p 8080; done"]

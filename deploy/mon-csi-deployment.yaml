@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csi-pvc-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: csi-pvc-monitor
+  template:
+    metadata:
+      labels:
+        app: csi-pvc-monitor
+    spec:
+      containers:
+      - name: monitor
+        image: busybox
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            date >> /data/heartbeat.txt 2>/data/monitor-error.log || {
+              echo "ERROR: Can’t write to PVC volume — possible CSI/PV outage at $(date)" | tee -a /data/monitor-error.log
+            }
+            sleep 10
+          done
+        volumeMounts:
+        - name: csi-vol
+          mountPath: /data
+      volumes:
+      - name: csi-vol
+        persistentVolumeClaim:
+          claimName: test-csi-pvc
