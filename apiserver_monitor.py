@@ -20,7 +20,6 @@ def main():
 
     while True:
         try:
-            # Simple API call
             v1.list_namespace(_request_timeout=3)
             if error_start:
                 recovery_time = datetime.utcnow() - error_start
@@ -31,9 +30,15 @@ def main():
         except Exception as e:
             if not error_start:
                 error_start = datetime.utcnow()
-                log(f"ERROR: kube-apiserver unavailable: {repr(e)}")
+                if isinstance(e, ApiException):
+                    log(f"ERROR: kube-apiserver unavailable: status={e.status}, reason={e.reason}, body={e.body}")
+                else:
+                    log(f"ERROR: kube-apiserver unavailable: {repr(e)}")
             else:
-                log(f"ERROR: still unavailable: {repr(e)} (outage ongoing)")
+                if isinstance(e, ApiException):
+                    log(f"ERROR: still unavailable: status={e.status}, reason={e.reason}, body={e.body} (outage ongoing)")
+                else:
+                    log(f"ERROR: still unavailable: {repr(e)} (outage ongoing)")
         time.sleep(5)
 
 if __name__ == "__main__":
