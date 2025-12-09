@@ -41,7 +41,6 @@ def main():
                     log(f"ERROR: still unavailable: status={e.status}, reason={e.reason}, body={e.body} (outage ongoing)")
                 else:
                     log(f"ERROR: still unavailable: {repr(e)} (outage ongoing)")
-        time.sleep(5)
         # Sleep until the top of the next second
         now = datetime.utcnow()
         next_second = (start + timedelta(seconds=1)).replace(microsecond=0)
