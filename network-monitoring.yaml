@@ -1,0 +1,686 @@
+---
+apiVersion: v1
+kind:  Namespace
+metadata:
+  name:  monitoring
+  labels:
+    app: network-monitor
+
+---
+# ConfigMap containing the monitoring scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-monitor-scripts
+  namespace: monitoring
+  labels:
+    app: network-monitor
+data:
+  dns-monitor.sh: |
+    #!/bin/bash
+    # DNS Resolution Monitor - Errors only
+
+    INTERVAL="${INTERVAL:-0.5}"
+    TARGETS="${DNS_TARGETS:-kubernetes.default.svc.cluster.local,google.com}"
+    
+    log_error() {
+        echo "[$(date -Iseconds)] [ERROR] [DNS] $1" >&2
+    }
+    
+    IFS=',' read -ra TARGET_ARRAY <<< "$TARGETS"
+
+    consecutive_failures=0
+    
+    while true; do
+        for target in "${TARGET_ARRAY[@]}"; do
+            start_time=$(date +%s%3N)
+
+            if result=$(nslookup "$target" 2>&1); then
+                end_time=$(date +%s%3N)
+                latency_ms=$((end_time - start_time))
+                consecutive_failures=0
+
+                # Log slow DNS responses (>500ms)
+                if [ "$latency_ms" -gt 500 ]; then
+                    log_error "SLOW resolution for $target: ${latency_ms}ms"
+                fi
+            else
+                consecutive_failures=$((consecutive_failures + 1))
+                log_error "Resolution FAILED for $target (consecutive: $consecutive_failures)"
+                if [ "$consecutive_failures" -ge 3 ]; then
+                    log_error "Diagnostics - resolv.conf: $(cat /etc/resolv.conf | tr '\n' ' ')"
+                fi
+            fi
+        done
+
+        sleep "$INTERVAL"
+    done
+
+  ping-monitor.sh: |
+    #!/bin/bash
+    # ICMP Ping Monitor - Errors only
+
+    INTERVAL="${INTERVAL:-0.5}"
+    TARGETS="${PING_TARGETS:-8.8.8.8,1.1.1.1}"
+    PING_TIMEOUT="${PING_TIMEOUT:-1}"
+    
+    log_error() {
+        echo "[$(date -Iseconds)] [ERROR] [PING] $1" >&2
+    }
+    
+    IFS=',' read -ra TARGET_ARRAY <<< "$TARGETS"
+    declare -A failure_counts
+    
+    while true; do
+        for target in "${TARGET_ARRAY[@]}"; do
+            if result=$(ping -c 1 -W "$PING_TIMEOUT" "$target" 2>&1); then
+                latency=$(echo "$result" | grep 'time=' | sed 's/.*time=\([0-9.]*\).*/\1/')
+                failure_counts[$target]=0
+
+                # Log high latency (>100ms)
+                if [ -n "$latency" ]; then
+                    is_high=$(echo "$latency" | awk '{if ($1 > 100) print 1; else print 0}')
+                    if [ "$is_high" -eq 1 ]; then
+                        log_error "High latency to $target: ${latency}ms"
+                    fi
+                fi
+            else
+                failure_counts[$target]=$((${failure_counts[$target]:-0} + 1))
+                log_error "FAILED to $target (consecutive: ${failure_counts[$target]})"
+            fi
+        done
+        sleep "$INTERVAL"
+    done
+
+  tcp-monitor.sh: |
+    #!/bin/bash
+    # TCP Connectivity Monitor - Errors only
+
+    INTERVAL="${INTERVAL:-0.5}"
+    TARGETS="${TCP_TARGETS:-8.8.8.8:53,1.1.1.1:53,google.com:443}"
+    TIMEOUT="${TCP_TIMEOUT:-2}"
+    
+    log_error() {
+        echo "[$(date -Iseconds)] [ERROR] [TCP] $1" >&2
+    }
+    
+    IFS=',' read -ra TARGET_ARRAY <<< "$TARGETS"
+
+    declare -A failure_counts
+    
+    while true; do
+        for target in "${TARGET_ARRAY[@]}"; do
+            host="${target%:*}"
+            port="${target#*:}"
+
+            start_time=$(date +%s%3N)
+
+            if nc -zv -w "$TIMEOUT" "$host" "$port" &>/dev/null; then
+                end_time=$(date +%s%3N)
+                latency_ms=$((end_time - start_time))
+                failure_counts[$target]=0
+
+                # Log slow connections (>1000ms)
+                if [ "$latency_ms" -gt 1000 ]; then
+                    log_error "SLOW connection to $target: ${latency_ms}ms"
+                fi
+            else
+                failure_counts[$target]=$((${failure_counts[$target]:-0} + 1))
+                log_error "FAILED to $host:$port (consecutive: ${failure_counts[$target]})"
+
+                if [ "${failure_counts[$target]}" -ge 10 ]; then
+                    log_error "Running traceroute to $host..."
+                    traceroute -m 15 -w 2 "$host" 2>&1 | while read line; do
+                        log_error "traceroute:  $line"
+                    done
+                    failure_counts[$target]=0
+                fi
+            fi
+        done
+
+        sleep "$INTERVAL"
+    done
+
+  http-monitor.sh: |
+    #!/bin/bash
+    # HTTP/HTTPS Connectivity Monitor - Errors only
+
+    INTERVAL="${INTERVAL:-1}"
+    TARGETS="${HTTP_TARGETS:-https://www.google.com}"
+    TIMEOUT="${HTTP_TIMEOUT:-5}"
+    
+    log_error() {
+        echo "[$(date -Iseconds)] [ERROR] [HTTP] $1" >&2
+    }
+    
+    IFS=',' read -ra TARGET_ARRAY <<< "$TARGETS"
+    
+    while true; do
+        for url in "${TARGET_ARRAY[@]}"; do
+            response=$(curl -s -o /dev/null -w "%{http_code}|%{time_total}|%{time_namelookup}|%{time_connect}" \
+                --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" -k "$url" 2>&1)
+            http_code=$(echo "$response" | cut -d'|' -f1)
+            time_total=$(echo "$response" | cut -d'|' -f2)
+            time_dns=$(echo "$response" | cut -d'|' -f3)
+            time_connect=$(echo "$response" | cut -d'|' -f4)
+            if echo "$http_code" | grep -qE '^[23]'; then
+                is_slow=$(echo "$time_total" | awk '{if ($1 > 3) print 1; else print 0}')
+                if [ "$is_slow" -eq 1 ]; then
+                    log_error "SLOW response from $url: ${time_total}s (DNS: ${time_dns}s, Connect: ${time_connect}s)"
+                fi
+            elif [ "$http_code" = "000" ]; then
+                log_error "TIMEOUT/FAILED to $url (DNS: ${time_dns}s, Connect: ${time_connect}s)"
+            else
+                log_error "Unexpected code $http_code from $url"
+            fi
+        done
+        sleep "$INTERVAL"
+    done
+
+  k8s-service-monitor.sh: |
+    #!/bin/bash
+    # Enhanced Kubernetes Service Monitor with detailed diagnostics
+    
+    INTERVAL="${INTERVAL:-0.5}"
+    K8S_SERVICES="${K8S_SERVICES:-kubernetes.default.svc.cluster.local:443}"
+    
+    log_error() {
+        echo "[$(date -Iseconds)] [ERROR] [K8S-SVC] $1" >&2
+    }
+    
+    # Detailed diagnostic dump on failure
+    dump_diagnostics() {
+        local host="$1"
+        local port="$2"
+        local failure_type="$3"
+        
+        log_error "=== DIAGNOSTIC DUMP START ($failure_type) ==="
+        
+        # DNS resolution details
+        log_error "--- DNS Resolution ---"
+        dns_result=$(nslookup "$host" 2>&1)
+        log_error "nslookup $host: $dns_result"
+        
+        # Get resolved IP
+        resolved_ip=$(echo "$dns_result" | grep -A1 "Name:" | grep "Address:" | awk '{print $2}' | head -1)
+        if [ -z "$resolved_ip" ]; then
+            resolved_ip=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | head -1)
+        fi
+        log_error "Resolved IP: ${resolved_ip:-FAILED TO RESOLVE}"
+        
+        # Try connecting to resolved IP directly
+        if [ -n "$resolved_ip" ]; then
+            log_error "--- Direct IP Connection Test ---"
+            if nc -zv -w 2 "$resolved_ip" "$port" &>/dev/null; then
+                log_error "Direct connection to $resolved_ip:$port:  SUCCESS"
+            else
+                log_error "Direct connection to $resolved_ip:$port: FAILED"
+            fi
+        fi
+        
+        # Endpoint details
+        log_error "--- Kubernetes Endpoints ---"
+        # Try to get endpoints via API if curl works
+        api_result=$(curl -sk --connect-timeout 2 \
+            --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+            -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)" \
+            "https://kubernetes.default.svc.cluster.local/api/v1/namespaces/default/endpoints/kubernetes" 2>&1)
+        log_error "API endpoints query: $api_result"
+        
+        # Network interface status
+        log_error "--- Network Interfaces ---"
+        ip_addr=$(ip addr show 2>&1 | grep -E "inet |state" | tr '\n' ' ')
+        log_error "Interfaces:  $ip_addr"
+        
+        # Route table
+        log_error "--- Routes ---"
+        routes=$(ip route show 2>&1 | tr '\n' ' ')
+        log_error "Routes: $routes"
+        
+        # DNS config
+        log_error "--- DNS Config ---"
+        resolv=$(cat /etc/resolv.conf 2>&1 | tr '\n' ' ')
+        log_error "resolv.conf: $resolv"
+        
+        # Test DNS server connectivity
+        log_error "--- DNS Server Connectivity ---"
+        dns_ip=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
+        if nc -zv -w 1 "$dns_ip" 53 &>/dev/null; then
+            log_error "DNS server $dns_ip: 53: REACHABLE"
+        else
+            log_error "DNS server $dns_ip:53: UNREACHABLE"
+        fi
+        
+        # TCP connection with verbose output
+        log_error "--- TCP Connection Verbose ---"
+        tcp_verbose=$(nc -zv -w 2 "$host" "$port" 2>&1)
+        log_error "nc output: $tcp_verbose"
+        
+        # Curl verbose to the service
+        log_error "--- HTTPS Connection Test ---"
+        curl_result=$(curl -vsk --connect-timeout 2 --max-time 5 \
+            "https://${host}:${port}/healthz" 2>&1 | head -30 | tr '\n' ' ')
+        log_error "curl verbose: $curl_result"
+        
+        # Check for conntrack/connection issues
+        log_error "--- Socket Stats ---"
+        ss_output=$(ss -tnp 2>&1 | grep -E "$port|ESTAB|TIME-WAIT" | head -10 | tr '\n' ' ')
+        log_error "ss output: $ss_output"
+        
+        # Timestamp and uptime
+        log_error "--- Timing ---"
+        log_error "Current time: $(date -Iseconds)"
+        log_error "Uptime: $(cat /proc/uptime 2>/dev/null | awk '{print $1}')s"
+        
+        log_error "=== DIAGNOSTIC DUMP END ==="
+    }
+    
+    IFS=',' read -ra SERVICE_ARRAY <<< "$K8S_SERVICES"
+    
+    declare -A failure_counts
+    declare -A last_diagnostic_time
+    
+    # Minimum seconds between diagnostic dumps for same target
+    DIAGNOSTIC_INTERVAL=30
+    
+    while true; do
+        current_time=$(date +%s)
+        
+        # Test CoreDNS
+        if !  nslookup kubernetes.default &>/dev/null; then
+            failure_counts["coredns"]=$((${failure_counts["coredns"]:-0} + 1))
+            log_error "CoreDNS failed for kubernetes.default (consecutive: ${failure_counts["coredns"]})"
+            
+            last_diag=${last_diagnostic_time["coredns"]:-0}
+            if [ $((current_time - last_diag)) -ge $DIAGNOSTIC_INTERVAL ]; then
+                dump_diagnostics "kubernetes.default" "443" "CoreDNS"
+                last_diagnostic_time["coredns"]=$current_time
+            fi
+        else
+            failure_counts["coredns"]=0
+        fi
+        
+        # Test kube-dns service
+        dns_ip=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
+        if ! nc -zv -w 1 "$dns_ip" 53 &>/dev/null; then
+            failure_counts["kubedns"]=$((${failure_counts["kubedns"]:-0} + 1))
+            log_error "Cannot reach kube-dns at $dns_ip:53 (consecutive: ${failure_counts["kubedns"]})"
+        else
+            failure_counts["kubedns"]=0
+        fi
+        
+        # Test configured services
+        for service in "${SERVICE_ARRAY[@]}"; do
+            host="${service%:*}"
+            port="${service#*:}"
+            
+            # DNS resolution test
+            if ! nslookup "$host" &>/dev/null; then
+                failure_counts["dns_$service"]=$((${failure_counts["dns_$service"]:-0} + 1))
+                log_error "DNS failed for $host (consecutive: ${failure_counts["dns_$service"]})"
+                continue
+            else
+                failure_counts["dns_$service"]=0
+            fi
+            
+            # TCP connectivity test with timing
+            start_time=$(date +%s%3N)
+            if nc -zv -w 2 "$host" "$port" &>/dev/null; then
+                end_time=$(date +%s%3N)
+                latency_ms=$((end_time - start_time))
+                failure_counts["tcp_$service"]=0
+                
+                # Log slow connections
+                if [ "$latency_ms" -gt 500 ]; then
+                    log_error "SLOW connection to $host:$port: ${latency_ms}ms"
+                fi
+            else
+                failure_counts["tcp_$service"]=$((${failure_counts["tcp_$service"]:-0} + 1))
+                log_error "Cannot connect to $host:$port (consecutive: ${failure_counts["tcp_$service"]})"
+                
+                # Run diagnostics, but not too frequently
+                last_diag=${last_diagnostic_time["$service"]:-0}
+                if [ $((current_time - last_diag)) -ge $DIAGNOSTIC_INTERVAL ]; then
+                    dump_diagnostics "$host" "$port" "TCP_CONNECT"
+                    last_diagnostic_time["$service"]=$current_time
+                fi
+            fi
+        done
+
+        sleep "$INTERVAL"
+    done
+
+---
+apiVersion: v1
+kind:  Namespace
+metadata:
+  name:  monitoring
+  labels:
+    app: network-monitor
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-monitor-dns
+  namespace: monitoring
+  labels:
+    app: network-monitor
+    component: dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-monitor
+      component: dns
+  template: 
+    metadata:
+      labels: 
+        app: network-monitor
+        component: dns
+    spec: 
+      containers:
+      - name:  dns-monitor
+        image: nicolaka/netshoot:latest
+        command:  ["/bin/bash", "/scripts/dns-monitor.sh"]
+        env:
+        - name:  INTERVAL
+          value: "0.5"
+        - name: DNS_TARGETS
+          value: "kubernetes.default.svc.cluster.local,google.com"
+        volumeMounts:
+        - name:  scripts
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name:  scripts
+        configMap:
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-monitor-ping
+  namespace: monitoring
+  labels:
+    app: network-monitor
+    component: ping
+spec: 
+  replicas: 1
+  selector:
+    matchLabels:
+      app: network-monitor
+      component: ping
+  template:
+    metadata:
+      labels:
+        app: network-monitor
+        component: ping
+    spec:
+      containers:
+      - name: ping-monitor
+        image: nicolaka/netshoot:latest
+        command: ["/bin/bash", "/scripts/ping-monitor.sh"]
+        env:
+        - name: INTERVAL
+          value: "0.5"
+        - name: PING_TARGETS
+          value: "8.8.8.8,1.1.1.1"
+        - name:  PING_TIMEOUT
+          value: "1"
+        volumeMounts: 
+        - name: scripts
+          mountPath: /scripts
+        resources: 
+          requests:
+            memory:  "64Mi"
+            cpu:  "100m"
+          limits: 
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: scripts
+        configMap: 
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-monitor-tcp
+  namespace: monitoring
+  labels:
+    app:  network-monitor
+    component: tcp
+spec:
+  replicas:  1
+  selector:
+    matchLabels:
+      app:  network-monitor
+      component: tcp
+  template:
+    metadata: 
+      labels:
+        app:  network-monitor
+        component: tcp
+    spec:
+      containers: 
+      - name: tcp-monitor
+        image: nicolaka/netshoot:latest
+        command:  ["/bin/bash", "/scripts/tcp-monitor.sh"]
+        env:
+        - name:  INTERVAL
+          value: "0.5"
+        - name: TCP_TARGETS
+          value: "8.8.8.8:53,1.1.1.1:53,google.com:443"
+        - name: TCP_TIMEOUT
+          value: "2"
+        volumeMounts: 
+        - name: scripts
+          mountPath: /scripts
+        resources: 
+          requests:
+            memory:  "64Mi"
+            cpu:  "100m"
+          limits: 
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: scripts
+        configMap: 
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: network-monitor-http
+  namespace: monitoring
+  labels:
+    app:  network-monitor
+    component: http
+spec:
+  replicas:  1
+  selector:
+    matchLabels:
+      app:  network-monitor
+      component: http
+  template:
+    metadata: 
+      labels:
+        app:  network-monitor
+        component: http
+    spec:
+      containers: 
+      - name: http-monitor
+        image: nicolaka/netshoot:latest
+        command:  ["/bin/bash", "/scripts/http-monitor.sh"]
+        env:
+        - name:  INTERVAL
+          value: "1"
+        - name: HTTP_TARGETS
+          value: "https://www.google.com"
+        - name: HTTP_TIMEOUT
+          value: "5"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: scripts
+        configMap:
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: 
+  name: network-monitor-k8s-svc
+  namespace: monitoring
+  labels:
+    app: network-monitor
+    component: k8s-svc
+spec: 
+  replicas: 1
+  selector:
+    matchLabels: 
+      app: network-monitor
+      component: k8s-svc
+  template:
+    metadata:
+      labels:
+        app: network-monitor
+        component:  k8s-svc
+    spec:
+      serviceAccountName: network-monitor
+      containers:
+      - name:  k8s-svc-monitor
+        image: nicolaka/netshoot:latest
+        command: ["/bin/bash", "/scripts/k8s-service-monitor.sh"]
+        env:
+        - name: INTERVAL
+          value: "0.5"
+        - name: K8S_SERVICES
+          value: "kubernetes.default.svc.cluster.local:443"
+        - name:  DIAGNOSTIC_INTERVAL
+          value:  "30"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: scripts
+        configMap:
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+apiVersion:  apps/v1
+kind: DaemonSet
+metadata:
+  name: network-monitor-node
+  namespace: monitoring
+  labels:
+    app: network-monitor
+    component: node
+spec: 
+  selector:
+    matchLabels:
+      app: network-monitor
+      component: node
+  template:
+    metadata:
+      labels:
+        app: network-monitor
+        component: node
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: node-monitor
+        image: nicolaka/netshoot:latest
+        command: ["/bin/bash", "/scripts/ping-monitor.sh"]
+        env:
+        - name: INTERVAL
+          value: "0.5"
+        - name: PING_TARGETS
+          value: "8.8.8.8,1.1.1.1"
+        - name: PING_TIMEOUT
+          value: "1"
+        volumeMounts: 
+        - name: scripts
+          mountPath: /scripts
+        resources: 
+          requests:
+            memory:  "64Mi"
+            cpu:  "100m"
+          limits: 
+            memory: "128Mi"
+            cpu: "200m"
+      volumes:
+      - name: scripts
+        configMap: 
+          name: network-monitor-scripts
+          defaultMode: 0755
+
+---
+# ServiceAccount for API access
+apiVersion: v1
+kind: ServiceAccount
+metadata: 
+  name: network-monitor
+  namespace: monitoring
+
+---
+# ClusterRole to read endpoints
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: network-monitor
+rules:
+- apiGroups: [""]
+  resources:  ["endpoints", "services"]
+  verbs:  ["get", "list"]
+
+---
+# Bind the role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: network-monitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name:  network-monitor
+subjects:
+- kind: ServiceAccount
+  name:  network-monitor
+  namespace: monitoring
