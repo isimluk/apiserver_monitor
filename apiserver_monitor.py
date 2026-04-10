@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timedelta
 from kubernetes import client, config
@@ -15,7 +16,12 @@ def main():
         config.load_kube_config()
         log("Loaded kubeconfig.")
 
-    v1 = client.CoreV1Api()
+    cfg = client.Configuration.get_default_copy()
+    if os.getenv("KUBERNETES_DEBUG") == "1":
+        cfg.debug = True
+    api_client = client.ApiClient(cfg)
+    v1 = client.CoreV1Api(api_client)
+
     error_start = None
 
     while True:
