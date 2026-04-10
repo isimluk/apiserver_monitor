@@ -21,7 +21,9 @@ def main():
     while True:
         start = datetime.utcnow()
         try:
-            v1.list_namespace(_request_timeout=3)
+            namespacelist = v1.list_namespace(_request_timeout=3)
+            assert isinstance(namespacelist, client.V1NamespaceList)
+
             if error_start:
                 recovery_time = datetime.utcnow() - error_start
                 log(f"RECOVERY: API server available after {recovery_time.total_seconds():.2f} seconds outage.")
